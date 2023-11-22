@@ -659,6 +659,10 @@ memalign(size_t alignment, size_t userSize)
 	 */
 	size_t internalSize;
 	size_t slack;
+
+	/* 
+	 * 最终返回给用户的地址
+	 */
 	char *address;
 
 	/* 
@@ -679,8 +683,8 @@ memalign(size_t alignment, size_t userSize)
 	 */
 
 	/* 
-	 * 如果设置了 EF_PROTECT_BELOW 为 0，则返回的地址需要按 page 对齐，这样他前面的 page 可以设置为无法访问
-	 * 此处判断没有设置，userSize 按 alignment 向上对齐
+	 * 如果设置了 EF_PROTECT_BELOW 为 0，在后面加不可访问的page，那么userSize需要对齐，这样返回地址也对齐
+	 * 如果设置了 EF_PROTECT_BELOW 为 1，在前面加不可访问的page，返回地址实际已经按 page 对齐了
 	 */
 	if (!EF_PROTECT_BELOW && alignment > 1)
 	{
@@ -695,8 +699,8 @@ memalign(size_t alignment, size_t userSize)
 	 */
 
 	/* 
-	 * internalSize 为 userSize 的内部大小，为了能让当前分配的内存后面是下一个page
-	 * 所以需要将 userSize 的大小转换成 page 的大小，返回的时候从挨着下一个 page 的地方往前找 userSize 返回
+	 * internalSize 为 userSize 的内部大小，我们需要额外包括一个不可访问的 page，所以加上一个 page 的大小
+	 * 为了保证每次分割后剩余部分仍然为page的整数，所以我们分配的大小需要按page对齐
 	 */
 	internalSize = userSize + bytesPerPage;
 	if ((slack = internalSize % bytesPerPage) != 0)
@@ -795,7 +799,7 @@ memalign(size_t alignment, size_t userSize)
 	}
 
 	/* 
-	 * 没有找到一个空闲的 slot，那么我们无法描述当前用于分配的这块内存，异常
+	 * 没有找到一个空闲的 slot，那么我们无法描述分割后的内存信息，异常
 	 */
 	if (!emptySlots[0])
 		internalError();
@@ -819,7 +823,7 @@ memalign(size_t alignment, size_t userSize)
 		size_t chunkSize = MEMORY_CREATION_SIZE;
 		
 		/* 
-		 * 没找到另一个空闲的 slot， 异常
+		 * 没找到另一个空闲的 slot，那么我们无法描述分割后的内存信息，异常
 		 */
 		if (!emptySlots[1])
 			internalError();
@@ -842,6 +846,9 @@ memalign(size_t alignment, size_t userSize)
 		 * 用 emptySlots[0] 来保存当前分配的内存的信息
 		 */
 		fullSlot = emptySlots[0];
+		/*
+		 * 让 emptySlots[0] 指向剩下的 emptySlots[1]
+		*/
 		emptySlots[0] = emptySlots[1];
 		fullSlot->internalAddress = Page_Create(chunkSize);
 		fullSlot->internalSize = chunkSize;
@@ -995,6 +1002,10 @@ memalign(size_t alignment, size_t userSize)
 /*
  * Find the slot structure for a user address.
  */
+
+/* 
+ * 从所有 slot 中找到 address 对应的 slot
+ */
 static Slot *
 slotForUserAddress(void *address)
 {
@@ -1013,6 +1024,10 @@ slotForUserAddress(void *address)
 
 /*
  * Find the slot structure for an internal address.
+ */
+
+/* 
+ * 找到 address 对应的 slot
  */
 static Slot *
 slotForInternalAddress(void *address)
@@ -1034,6 +1049,10 @@ slotForInternalAddress(void *address)
  * before that buffer in the address space. This is used by free() to
  * coalesce two free buffers into one.
  */
+
+/* 
+ * 找到 address 前一个 slot ，用于 free 的时候合并
+ */
 static Slot *
 slotForInternalAddressPreviousTo(void *address)
 {
@@ -1042,6 +1061,9 @@ slotForInternalAddressPreviousTo(void *address)
 
 	for (; count > 0; count--)
 	{
+		/* 
+		 * 当前 slot 对应内存的起始地址加上大小刚好等于 address
+		 */
 		if (((char *)slot->internalAddress) + slot->internalSize == address)
 			return slot;
 		slot++;
@@ -1064,19 +1086,34 @@ free(void *address)
 		return;
 	}
 
+	/*
+	 * allocationList 为空，说明没有初始化过
+	*/
 	if (allocationList == 0)
 		EF_Abort("free() called before first malloc().");
 
 	if (!noAllocationListProtection)
 		Page_AllowAccess(allocationList, allocationListSize);
 
+	/*
+	 * 找到 address 对应的 slot
+	*/
 	slot = slotForUserAddress(address);
 
+	/*
+	 * 没有找到对应的 slot，说明不是通过 malloc 分配出来的地址，或者之前已经还回去了被合并了
+	*/
 	if (!slot)
 		EF_Abort("free(%a): address not from malloc().", address);
 
+	/* 
+	 * slot 的类型不为 ALLOCATED，说明该 slot 已经释放过了
+	 */
 	if (slot->mode != ALLOCATED)
 	{
+		/* 
+		 * 当前为我们内部申请释放内存，不处理
+		 */
 		if (internalUse && slot->mode == INTERNAL_USE)
 			/* Do nothing. */;
 		else
@@ -1086,41 +1123,83 @@ free(void *address)
 		}
 	}
 
+	/* 
+	 * 判断当前 slot 被 free 后是否需要保护起来
+	 */
 	if (EF_PROTECT_FREE)
 		slot->mode = PROTECTED;
 	else
 		slot->mode = FREE;
 
+	/*
+	 * 判断当前 slot 是否需要被清空
+	*/
 	if (EF_FREE_WIPES)
 		memset(slot->userAddress, 0xbd, slot->userSize);
 
+	/*
+	 * 从所有 slot 中找到当前 slot 的虚拟地址相邻的前一个 slot
+	*/
 	previousSlot = slotForInternalAddressPreviousTo(slot->internalAddress);
+
+	/* 
+	 * 找到当前 slot 的虚拟地址相邻的下一个 slot
+	 */
 	nextSlot = slotForInternalAddress(
 		((char *)slot->internalAddress) + slot->internalSize);
 
+	/* 
+	 * 判断前一个 slot 是否存在且类型是 FREE 或 PROTECTED
+	 */
 	if (previousSlot && (previousSlot->mode == FREE || previousSlot->mode == PROTECTED))
 	{
 		/* Coalesce previous slot with this one. */
+		/* 
+		 * 将前一个 slot 对应的内存跟当前 slot 对应的内存进行合并
+		 */
 		previousSlot->internalSize += slot->internalSize;
+
+		/* 
+		 * 设置了当前内存需要保护起来，则将合并的整块内存设置为 PROTECTED
+		 */
 		if (EF_PROTECT_FREE)
 			previousSlot->mode = PROTECTED;
 
+		/*
+		 * 清空当前 slot 的信息，释放未使用
+		*/
 		slot->internalAddress = slot->userAddress = 0;
 		slot->internalSize = slot->userSize = 0;
 		slot->mode = NOT_IN_USE;
+		/* 
+		 * 将当前 slot 设置为合并后的slot，用于跟后一个合并
+		 */
 		slot = previousSlot;
+		// 未使用的 slot 加一个
 		unUsedSlots++;
 	}
+
+	/* 
+	 * 后一个 slot 也存在且类型为 FREE 或 PROTECTED
+	 */
 	if (nextSlot && (nextSlot->mode == FREE || nextSlot->mode == PROTECTED))
 	{
 		/* Coalesce next slot with this one. */
+		/* 
+		 * 将 slot 与下一个 slot 合并
+		 * 并释放下一个 slot，清空
+		 */
 		slot->internalSize += nextSlot->internalSize;
 		nextSlot->internalAddress = nextSlot->userAddress = 0;
 		nextSlot->internalSize = nextSlot->userSize = 0;
 		nextSlot->mode = NOT_IN_USE;
+		// 未使用的 slot 加一个
 		unUsedSlots++;
 	}
 
+	/*
+	 * 更新 slot 的用户信息
+	*/
 	slot->userAddress = slot->internalAddress;
 	slot->userSize = slot->internalSize;
 
@@ -1130,6 +1209,10 @@ free(void *address)
 	 * denied for the life of the process. When EF_PROTECT_FREE is false,
 	 * the memory may be re-allocated, at which time access to it will be
 	 * allowed again.
+	 */
+
+	/* 
+	 * 将释放后的 slot 设置为不可访问
 	 */
 	Page_DenyAccess(slot->internalAddress, slot->internalSize);
 
